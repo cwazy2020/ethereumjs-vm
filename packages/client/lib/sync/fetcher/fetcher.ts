@@ -1,7 +1,11 @@
 import { Readable, Writable } from 'stream'
 const Heap = require('qheap')
+
 import { PeerPool } from '../../net/peerpool'
 import { Config } from '../../config'
+
+import {QHeap, Job} from '../../types'
+import { Peer } from '../../net/peer'
 
 export interface FetcherOptions {
   /* Common chain config*/
@@ -33,7 +37,7 @@ export interface FetcherOptions {
  * inorder.
  * @memberof module:sync/fetcher
  */
-export class Fetcher extends Readable {
+export abstract class Fetcher<JobTask, JobResult> extends Readable {
   public config: Config
 
   protected pool: PeerPool
@@ -42,13 +46,15 @@ export class Fetcher extends Readable {
   protected banTime: number
   protected maxQueue: number
   protected maxPerRequest: number
-  protected in: any
-  protected out: any
+  protected in: QHeap<Job<JobTask, JobResult>>
+  protected out: QHeap<Job<JobTask, JobResult>>
   protected total: number
   protected processed: number
   protected running: boolean
   protected reading: boolean
-  private _readableState: any
+  private _readableState?: { // This property is inherited from Readable. We only need `length`.
+    length: number
+  }
 
   /**
    * Create new fetcher
@@ -65,8 +71,8 @@ export class Fetcher extends Readable {
     this.maxQueue = options.maxQueue ?? 16
     this.maxPerRequest = options.maxPerRequest ?? 128
 
-    this.in = new Heap({ comparBefore: (a: any, b: any) => a.index < b.index })
-    this.out = new Heap({ comparBefore: (a: any, b: any) => a.index < b.index })
+    this.in = new Heap({ comparBefore: (a: Job<JobTask, JobResult>, b: Job<JobTask, JobResult>) => a.index < b.index })
+    this.out = new Heap({ comparBefore: (a: Job<JobTask, JobResult>, b: Job<JobTask, JobResult>) => a.index < b.index })
     this.total = 0
     this.processed = 0
     this.running = false
@@ -77,7 +83,7 @@ export class Fetcher extends Readable {
    * Generate list of tasks to fetch
    * @return {Object[]} tasks
    */
-  tasks(): object[] {
+  tasks(): JobTask[] {
     return []
   }
 
@@ -85,7 +91,7 @@ export class Fetcher extends Readable {
    * Enqueue job
    * @param job
    */
-  enqueue(job: any) {
+  enqueue(job: Job<JobTask, JobResult>) {
     if (this.running) {
       this.in.insert({
         ...job,
@@ -102,7 +108,7 @@ export class Fetcher extends Readable {
   dequeue() {
     for (let f = this.out.peek(); f && f.index === this.processed; ) {
       this.processed++
-      const { result } = this.out.remove()
+      const { result } = this.out.remove()!
       if (!this.push(result)) {
         return
       }
@@ -123,17 +129,17 @@ export class Fetcher extends Readable {
    * @param  job successful job
    * @param  result job result
    */
-  success(job: any, result: any) {
+  success(job: Job<JobTask, JobResult>, result?: JobResult[]) {
     if (job.state !== 'active') return
     if (result === undefined) {
       this.enqueue(job)
       // TODO: should this promise actually float?
       // eslint-disable-next-line @typescript-eslint/no-floating-promises
       this.wait().then(() => {
-        job.peer.idle = true
+        job.peer!.idle = true
       })
     } else {
-      job.peer.idle = true
+      job.peer!.idle = true
       job.result = this.process(job, result)
       if (job.result) {
         this.out.insert(job)
@@ -151,10 +157,10 @@ export class Fetcher extends Readable {
    * @param  job failed job
    * @param  [error] error
    */
-  failure(job: any, error?: Error) {
+  failure(job: Job<JobTask, JobResult>, error?: Error) {
     if (job.state !== 'active') return
-    job.peer.idle = true
-    this.pool.ban(job.peer, this.banTime)
+    job.peer!.idle = true
+    this.pool.ban(job.peer!, this.banTime)
     this.enqueue(job)
     if (error) {
       this.error(error, job)
@@ -169,7 +175,7 @@ export class Fetcher extends Readable {
     const job = this.in.peek()
     if (
       !job ||
-      this._readableState.length > this.maxQueue ||
+      this._readableState!.length > this.maxQueue ||
       job.index > this.processed + this.maxQueue ||
       this.processed === this.total
     ) {
@@ -186,7 +192,7 @@ export class Fetcher extends Readable {
         this.expire(job)
       }, this.timeout)
       this.request(job, peer)
-        .then((result: any) => this.success(job, result))
+        .then((result: JobResult[]) => this.success(job, result))
         .catch((error: Error) => this.failure(job, error))
         .finally(() => clearTimeout(timeout))
       return job
@@ -198,7 +204,7 @@ export class Fetcher extends Readable {
    * @param  {Error}  error error object
    * @param  {Object} job  task
    */
-  error(error: Error, job?: any) {
+  error(error: Error, job?: Job<JobTask, JobResult>) {
     if (this.running) {
       this.emit('error', error, job && job.task, job && job.peer)
     }
@@ -209,7 +215,7 @@ export class Fetcher extends Readable {
    * to support backpressure from storing results.
    */
   write() {
-    const _write = async (result: any, encoding: any, cb: Function) => {
+    const _write = async (result: JobResult[], encoding: string | null, cb: Function) => {
       try {
         await this.store(result)
         this.emit('fetched', result)
@@ -221,8 +227,8 @@ export class Fetcher extends Readable {
     const writer = new Writable({
       objectMode: true,
       write: _write,
-      writev: (many: any, cb: Function) =>
-        _write([].concat(...many.map((x: any) => x.chunk)), null, cb),
+      writev: (many: { chunk: JobResult, encoding: string}[], cb: Function) =>
+        _write((<JobResult[]>[]).concat(...many.map((x: { chunk: JobResult, encoding: string}) => x.chunk)), null, cb),
     })
     this.on('close', () => {
       this.running = false
@@ -232,7 +238,7 @@ export class Fetcher extends Readable {
       .on('finish', () => {
         this.running = false
       })
-      .on('error', (error: any) => {
+      .on('error', (error: Error) => {
         this.error(error)
         this.running = false
         writer.destroy()
@@ -248,8 +254,8 @@ export class Fetcher extends Readable {
       return false
     }
     this.write()
-    this.tasks().forEach((task) => {
-      const job = {
+    this.tasks().forEach((task: JobTask) => {
+      const job: Job<JobTask, JobResult> = {
         task,
         time: Date.now(),
         index: this.total++,
@@ -277,7 +283,7 @@ export class Fetcher extends Readable {
    * @return {Peer}
    */
   // TODO: what is job supposed to be?
-  peer(_job?: any) {
+  peer(_job?: Job<JobTask, JobResult>) {
     return this.pool.idle()
   }
 
@@ -287,31 +293,26 @@ export class Fetcher extends Readable {
    * @param  peer
    * @return {Promise}
    */
-  request(_job?: any, _peer?: any): Promise<any> {
-    throw new Error('Unimplemented')
-  }
+  abstract request(_job?: Job<JobTask, JobResult>, _peer?: Peer): Promise<JobResult[]> 
 
   /**
    * Process the reply for the given job
    * @param  job fetch job
-   * @param  {Peer}   peer peer that handled task
    * @param  result result data
    */
-  process(_job?: any, _peer?: any, _result?: any) {
-    throw new Error('Unimplemented')
-  }
+  abstract process(_job?: Job<JobTask, JobResult>, _result?: JobResult[]): JobResult[] | null
 
   /**
    * Expire job that has timed out and ban associated peer. Timed out tasks will
    * be re-inserted into the queue.
    */
-  expire(job: any) {
+  expire(job: Job<JobTask, JobResult>) {
     job.state = 'expired'
-    if (this.pool.contains(job.peer)) {
+    if (this.pool.contains(job.peer!)) {
       this.config.logger.debug(
         `Task timed out for peer (banning) ${JSON.stringify(job.task)} ${job.peer}`
       )
-      this.pool.ban(job.peer, 300000)
+      this.pool.ban(job.peer!, 300000)
     } else {
       this.config.logger.debug(
         `Peer disconnected while performing task ${JSON.stringify(job.task)} ${job.peer}`
@@ -325,9 +326,7 @@ export class Fetcher extends Readable {
    * @param result fetch result
    * @return {Promise}
    */
-  async store(_result?: any) {
-    throw new Error('Unimplemented')
-  }
+  abstract async store(_result?: JobResult[]): Promise<void>
 
   async wait(delay?: number) {
     await new Promise((resolve) => setTimeout(resolve, delay || this.interval))
