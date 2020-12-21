@@ -4,7 +4,7 @@ const Heap = require('qheap')
 import { PeerPool } from '../../net/peerpool'
 import { Config } from '../../config'
 
-import {QHeap, Job} from '../../types'
+import { QHeap, Job } from '../../types'
 import { Peer } from '../../net/peer'
 
 export interface FetcherOptions {
@@ -37,7 +37,7 @@ export interface FetcherOptions {
  * inorder.
  * @memberof module:sync/fetcher
  */
-export abstract class Fetcher<JobTask, JobResult> extends Readable {
+export abstract class Fetcher<JobTask, JobResult, StorageItem> extends Readable {
   public config: Config
 
   protected pool: PeerPool
@@ -52,7 +52,8 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
   protected processed: number
   protected running: boolean
   protected reading: boolean
-  private _readableState?: { // This property is inherited from Readable. We only need `length`.
+  private _readableState?: {
+    // This property is inherited from Readable. We only need `length`.
     length: number
   }
 
@@ -71,8 +72,12 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
     this.maxQueue = options.maxQueue ?? 16
     this.maxPerRequest = options.maxPerRequest ?? 128
 
-    this.in = new Heap({ comparBefore: (a: Job<JobTask, JobResult>, b: Job<JobTask, JobResult>) => a.index < b.index })
-    this.out = new Heap({ comparBefore: (a: Job<JobTask, JobResult>, b: Job<JobTask, JobResult>) => a.index < b.index })
+    this.in = new Heap({
+      comparBefore: (a: Job<JobTask, JobResult>, b: Job<JobTask, JobResult>) => a.index < b.index,
+    })
+    this.out = new Heap({
+      comparBefore: (a: Job<JobTask, JobResult>, b: Job<JobTask, JobResult>) => a.index < b.index,
+    })
     this.total = 0
     this.processed = 0
     this.running = false
@@ -129,7 +134,7 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
    * @param  job successful job
    * @param  result job result
    */
-  success(job: Job<JobTask, JobResult>, result?: JobResult[]) {
+  success(job: Job<JobTask, JobResult>, result?: JobResult) {
     if (job.state !== 'active') return
     if (result === undefined) {
       this.enqueue(job)
@@ -192,7 +197,7 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
         this.expire(job)
       }, this.timeout)
       this.request(job, peer)
-        .then((result: JobResult[]) => this.success(job, result))
+        .then((result?: JobResult) => this.success(job, result))
         .catch((error: Error) => this.failure(job, error))
         .finally(() => clearTimeout(timeout))
       return job
@@ -215,7 +220,7 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
    * to support backpressure from storing results.
    */
   write() {
-    const _write = async (result: JobResult[], encoding: string | null, cb: Function) => {
+    const _write = async (result: StorageItem[], encoding: string | null, cb: Function) => {
       try {
         await this.store(result)
         this.emit('fetched', result)
@@ -227,8 +232,14 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
     const writer = new Writable({
       objectMode: true,
       write: _write,
-      writev: (many: { chunk: JobResult, encoding: string}[], cb: Function) =>
-        _write((<JobResult[]>[]).concat(...many.map((x: { chunk: JobResult, encoding: string}) => x.chunk)), null, cb),
+      writev: (many: { chunk: StorageItem; encoding: string }[], cb: Function) =>
+        _write(
+          (<StorageItem[]>[]).concat(
+            ...many.map((x: { chunk: StorageItem; encoding: string }) => x.chunk)
+          ),
+          null,
+          cb
+        ),
     })
     this.on('close', () => {
       this.running = false
@@ -293,14 +304,14 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
    * @param  peer
    * @return {Promise}
    */
-  abstract request(_job?: Job<JobTask, JobResult>, _peer?: Peer): Promise<JobResult[]> 
+  abstract request(_job?: Job<JobTask, JobResult>, _peer?: Peer): Promise<JobResult | undefined>
 
   /**
    * Process the reply for the given job
    * @param  job fetch job
    * @param  result result data
    */
-  abstract process(_job?: Job<JobTask, JobResult>, _result?: JobResult[]): JobResult[] | null
+  abstract process(_job?: Job<JobTask, JobResult>, _result?: JobResult): JobResult | null
 
   /**
    * Expire job that has timed out and ban associated peer. Timed out tasks will
@@ -326,7 +337,7 @@ export abstract class Fetcher<JobTask, JobResult> extends Readable {
    * @param result fetch result
    * @return {Promise}
    */
-  abstract async store(_result?: JobResult[]): Promise<void>
+  abstract async store(_result?: StorageItem[]): Promise<void>
 
   async wait(delay?: number) {
     await new Promise((resolve) => setTimeout(resolve, delay || this.interval))
